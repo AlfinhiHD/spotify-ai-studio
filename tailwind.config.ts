@@ -1,0 +1,28 @@
+import type { Config } from 'tailwindcss';
+
+const config: Config = {
+  content: [
+    './src/pages/**/*.{js,ts,jsx,tsx,mdx}',
+    './src/components/**/*.{js,ts,jsx,tsx,mdx}',
+    './src/app/**/*.{js,ts,jsx,tsx,mdx}',
+  ],
+  theme: {
+    extend: {
+      colors: {
+        spotify: {
+          green: '#1ED760',
+          darkGreen: '#1DB954',
+          black: '#000000',
+          base: '#121212',
+          card: '#181818',
+          elevated: '#242424',
+          hover: '#282828',
+          subdued: '#B3B3B3',
+        },
+      },
+    },
+  },
+  plugins: [],
+};
+
+export default config;
