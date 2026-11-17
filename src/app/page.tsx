@@ -3,7 +3,9 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   Activity,
+  ArrowDown,
   ArrowLeft,
+  ArrowUp,
   ArrowUpDown,
   Check,
   Clock,
@@ -20,9 +22,12 @@ import {
   LogOut,
   Play,
   Plus,
+  RefreshCw,
+  Save,
   Search,
   Settings,
   Shuffle,
+  SlidersHorizontal,
   Sparkles,
   Trash2,
   Users,
@@ -52,9 +57,11 @@ import {
 import {
   createSpotifyPlaylist,
   fetchAllListeningData,
+  fetchAllUserPlaylists,
   fetchPlaylistTracks,
   resolveCandidatesInParallel,
   searchTracksLive,
+  updateSpotifyPlaylist,
 } from '@/lib/spotifyApi';
 import {
   arrangeTracksByEnergyFlow,
@@ -133,11 +140,13 @@ export default function HomePage() {
   const [prompt, setPrompt] = useState<string>(VIBE_PRESETS[0].prompt);
   const [curationMode, setCurationMode] = useState<
     'smart-spotify' | 'gemini' | 'custom-list'
-  >('smart-spotify');
+  >('gemini');
   const [customTrackText, setCustomTrackText] = useState<string>(
     "Hindia - Evaluasi\nNIKI - lowkey\nHONNE - la la la that's how it goes\nRex Orange County - Pluto Projector\nLANY - Malibu Nights\nMen I Trust - Show Me How"
   );
   const [useListeningTaste, setUseListeningTaste] = useState<boolean>(true);
+  const [tasteBlendMode, setTasteBlendMode] = useState<'balanced' | 'discovery'>('balanced');
+  const [trackCount, setTrackCount] = useState<number>(20);
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
   const [isEnhancingPrompt, setIsEnhancingPrompt] = useState<boolean>(false);
   const [pipelineStage, setPipelineStage] = useState<string>('');
@@ -150,6 +159,7 @@ export default function HomePage() {
   const [draft, setDraft] = useState<PlaylistDraft>(() =>
     buildInitialDemoDraft(VIBE_PRESETS[0].id)
   );
+  const [curationNotice, setCurationNotice] = useState<string | null>(null);
   const [activeTrack, setActiveTrack] = useState<SpotifyTrack | null>(
     () => DEMO_LISTENING_DATA.topTracks.short_term[0] || null
   );
@@ -180,10 +190,16 @@ export default function HomePage() {
       try {
         const existingToken = await getValidAccessToken();
         if (existingToken) {
+          const data = await fetchAllListeningData(existingToken);
           setToken(existingToken);
           setIsDemo(false);
-          const data = await fetchAllListeningData(existingToken);
           setListeningData(data);
+
+          if (data.playlistWarning) {
+            notify(
+              `Playlist Spotify gagal dimuat (${data.playlistWarning}). Coba Logout & Login ulang.`
+            );
+          }
 
           if (data.currentlyPlaying?.item) {
             setActiveTrack(data.currentlyPlaying.item);
@@ -215,8 +231,15 @@ export default function HomePage() {
             });
           }
         }
-      } catch {
-        // Fallback to demo state gracefully
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/401|403|forbidden|expired/i.test(msg)) {
+          notify(
+            'Sesi Spotify ditolak (401/403). Pastikan akun terdaftar di Spotify Dashboard atau Login ulang.'
+          );
+        } else {
+          notify(`Gagal sinkronisasi Spotify: ${msg}`);
+        }
       } finally {
         setInitialSyncing(false);
       }
@@ -274,11 +297,33 @@ export default function HomePage() {
     try {
       const data = await fetchAllListeningData(token);
       setListeningData(data);
-      notify('Data Listening DNA berhasil diperbarui dari Spotify!');
+      if (data.playlistWarning) {
+        notify(
+          `Data DNA dimuat, tapi playlist gagal (${data.playlistWarning}).`
+        );
+      } else {
+        notify('Data Listening DNA & Library Playlist berhasil diperbarui!');
+      }
     } catch (err) {
       notify(err instanceof Error ? err.message : 'Gagal memuat ulang data.');
     } finally {
       setInitialSyncing(false);
+    }
+  };
+
+  const refreshLibraryPlaylists = async (activeToken: string, userId?: string) => {
+    try {
+      const freshPlaylists = await fetchAllUserPlaylists(activeToken, userId);
+      setListeningData((prev) => {
+        const likedEntry = prev.playlists.find((p) => p.id === 'liked-songs');
+        return {
+          ...prev,
+          playlists: likedEntry ? [likedEntry, ...freshPlaylists] : freshPlaylists,
+          playlistWarning: undefined,
+        };
+      });
+    } catch {
+      // Non-fatal background refresh
     }
   };
 
@@ -305,6 +350,7 @@ export default function HomePage() {
 
     setIsGenerating(true);
     setCreatedResult(null);
+    setCurationNotice(null);
     setPhaseFilter('ALL');
     setSearchProgress({ done: 0, total: 0 });
     setActiveView('create');
@@ -314,7 +360,16 @@ export default function HomePage() {
         name: string;
         description: string;
         candidates: ReturnType<typeof parseCustomTrackLines>;
+        usedFallback?: boolean;
+        modelUsed?: string;
+        warning?: string;
       };
+      let activeSource: 'gemini' | 'smart-spotify' | 'custom-list' = curationMode;
+
+      const effectiveKey =
+        geminiKey.trim() ||
+        process.env.NEXT_PUBLIC_GEMINI_API_KEY ||
+        '';
 
       if (curationMode === 'custom-list' && !overridePrompt) {
         setPipelineStage('Menganalisis daftar lagu manual & merancang Energy Arc...');
@@ -322,30 +377,79 @@ export default function HomePage() {
         if (!candidates.length) {
           throw new Error('Format baris: Nama Artis - Judul Lagu');
         }
+        activeSource = 'custom-list';
         plan = {
           name: 'Custom Curated Mix',
           description: 'Disusun dengan Sepotifi AI Studio.',
           candidates,
         };
-      } else if (curationMode === 'gemini') {
-        const effectiveKey =
-          geminiKey.trim() ||
-          process.env.NEXT_PUBLIC_GEMINI_API_KEY ||
-          '';
+      } else if (curationMode === 'gemini' || (overridePrompt !== undefined && !targetPresetId && effectiveKey)) {
         if (!effectiveKey) {
           setShowSettings(true);
           throw new Error(
-            'Masukkan Gemini API Key di Pengaturan atau gunakan mode Smart DNA.'
+            'Masukkan Gemini API Key di Pengaturan atau gunakan mode Smart Rule.'
           );
         }
-        setPipelineStage('Gemini AI DJ sedang meracik 22 lagu & rotasi artis...');
+
+        // Check if user prompt references an existing playlist in their Spotify library
+        let referencedPlaylistContext = '';
+        if (listeningData?.playlists && token && !isDemo && targetPrompt.trim()) {
+          const cleanPromptLower = targetPrompt.toLowerCase();
+          const matchedPl = listeningData.playlists.find((p) => {
+            const plNameLower = p.name.trim().toLowerCase();
+            if (p.id === 'liked-songs') {
+              return /liked songs|lagu yang disukai|koleksi favorit/i.test(cleanPromptLower);
+            }
+            return (
+              plNameLower.length >= 3 &&
+              !p.id.startsWith('demo-') &&
+              cleanPromptLower.includes(plNameLower)
+            );
+          });
+
+          if (matchedPl) {
+            setPipelineStage(
+              `Membaca lagu dari playlist library "${matchedPl.name}"...`
+            );
+            try {
+              const plTracks = await fetchPlaylistTracks(
+                token,
+                matchedPl.id,
+                matchedPl.name
+              );
+              if (plTracks.length > 0) {
+                const sampleTracks = plTracks
+                  .slice(0, 18)
+                  .map((t) => `"${t.name}" by ${t.artists[0]?.name}`)
+                  .join(', ');
+                referencedPlaylistContext = `The user specifically asked for a playlist related/connected to their existing Spotify playlist: "${matchedPl.name}".
+Tracks currently inside "${matchedPl.name}": [${sampleTracks}].
+CRITICAL REQUIREMENT: Match the exact sonic universe, emotional texture, instrumentals, and subgenre of these tracks. Curate complementary tracks that sound like an authentic companion mix to "${matchedPl.name}".`;
+              }
+            } catch {
+              // Non-fatal
+            }
+          }
+        }
+
+        setPipelineStage(`Gemini AI DJ sedang meracik ${trackCount} lagu & alur energi...`);
         plan = await generateGeminiCuratedPlan(
           effectiveKey,
           targetPrompt,
           listeningData,
-          useListeningTaste
+          useListeningTaste,
+          trackCount,
+          tasteBlendMode,
+          referencedPlaylistContext
         );
+        activeSource = plan.usedFallback ? 'smart-spotify' : 'gemini';
+        if (plan.usedFallback && plan.warning) {
+          setCurationNotice(
+            `Gemini gagal (${plan.warning}) — sementara memakai Smart Rule offline.`
+          );
+        }
       } else {
+        activeSource = 'smart-spotify';
         setPipelineStage(
           'Smart Curator sedang memadukan tema dengan Listening DNA kamu...'
         );
@@ -353,7 +457,8 @@ export default function HomePage() {
           targetPrompt,
           listeningData,
           useListeningTaste,
-          targetPresetId
+          targetPresetId,
+          trackCount
         );
       }
 
@@ -366,13 +471,15 @@ export default function HomePage() {
           : await resolveCandidatesInParallel(
               token,
               plan.candidates,
-              (done, total) => setSearchProgress({ done, total })
+              (done, total) => setSearchProgress({ done, total }),
+              trackCount
             );
 
-      const finalItems =
+      const rawItems =
         resolved.items.length > 0
           ? resolved.items
           : resolveCandidatesDemo(plan.candidates).items;
+      const finalItems = rawItems.slice(0, trackCount);
 
       const targetPreset = VIBE_PRESETS.find((p) => p.id === targetPresetId);
 
@@ -383,14 +490,22 @@ export default function HomePage() {
         prompt: targetPrompt,
         items: finalItems,
         skipped: resolved.skipped,
-        curationSource: curationMode,
+        curationSource: activeSource,
         coverUrl: targetPreset?.image || finalItems[0]?.track.album.images?.[0]?.url,
       });
 
-      if (resolved.items[0]?.track) {
-        setActiveTrack(resolved.items[0].track);
+      if (finalItems[0]?.track) {
+        setActiveTrack(finalItems[0].track);
       }
-      notify(`Playlist "${plan.name}" (${resolved.items.length} lagu) siap!`);
+      if (plan.usedFallback && plan.warning) {
+        notify(`Gemini bermasalah (${plan.warning}) — fallback ke Smart Rule.`);
+      } else {
+        notify(
+          `Playlist "${plan.name}" (${finalItems.length} lagu${
+            plan.modelUsed ? ` • ${plan.modelUsed}` : ''
+          }) siap!`
+        );
+      }
     } catch (err) {
       notify(err instanceof Error ? err.message : 'Gagal menyusun playlist.');
     } finally {
@@ -407,12 +522,53 @@ export default function HomePage() {
     }
     setIsSavingPlaylist(true);
     try {
-      const result = await createSpotifyPlaylist(token, draft);
+      const result = await createSpotifyPlaylist(
+        token,
+        draft,
+        listeningData.profile.id
+      );
       setCreatedResult(result);
-      notify(`Tersimpan di Spotify kamu: "${result.name}"`);
+      await refreshLibraryPlaylists(token, listeningData.profile.id);
+      notify(`Tersimpan sebagai playlist baru: "${result.name}"`);
     } catch (err) {
       notify(
         err instanceof Error ? err.message : 'Gagal menyimpan ke Spotify.'
+      );
+    } finally {
+      setIsSavingPlaylist(false);
+    }
+  };
+
+  const handleUpdateExistingPlaylist = async () => {
+    if (!draft.items.length || !draft.originalPlaylistId) return;
+    if (isDemo || !token) {
+      handleConnectSpotify();
+      return;
+    }
+    setIsSavingPlaylist(true);
+    try {
+      const result = await updateSpotifyPlaylist(
+        token,
+        draft.originalPlaylistId,
+        draft
+      );
+      setCreatedResult(result);
+      setSelectedLibraryPlaylist((prev) =>
+        prev && prev.id === result.id
+          ? {
+              ...prev,
+              name: draft.name,
+              description: draft.description,
+              public: draft.isPublic,
+              tracks: { total: result.trackCount },
+            }
+          : prev
+      );
+      await refreshLibraryPlaylists(token, listeningData.profile.id);
+      notify(`Playlist asli "${result.name}" berhasil diperbarui!`);
+    } catch (err) {
+      notify(
+        err instanceof Error ? err.message : 'Gagal memperbarui playlist Spotify.'
       );
     } finally {
       setIsSavingPlaylist(false);
@@ -478,7 +634,13 @@ export default function HomePage() {
         name: enhanced.suggestedTitle,
         prompt: enhanced.refinedPrompt,
       }));
-      notify('Prompt berhasil diperkaya & dirapikan oleh Gemini AI!');
+      if (enhanced.usedFallback) {
+        notify(
+          `Gemini belum merespons (${enhanced.warning || 'fallback lokal'}) — memakai template prompt.`
+        );
+      } else {
+        notify('Prompt berhasil diperkaya & dirapikan oleh Gemini AI!');
+      }
     } catch {
       notify('Gagal menyempurnakan prompt.');
     } finally {
@@ -490,36 +652,72 @@ export default function HomePage() {
   const handleOpenLibraryPlaylist = async (pl: SpotifyPlaylistSummary) => {
     setSelectedLibraryPlaylist(pl);
     setActiveView('library');
-    if (!token || isDemo) {
+    setCreatedResult(null);
+    setPhaseFilter('ALL');
+    const isDemoPlaylist =
+      pl.id.startsWith('demo-') || pl.id === 'pl1' || pl.id === 'pl2';
+    if ((!token || isDemo) && !isDemoPlaylist) {
       notify('Hubungkan akun Spotify untuk memuat lagu asli dari playlist ini.');
       return;
     }
     setLoadingLibraryTracks(true);
     notify(`Memuat lagu dari "${pl.name}"...`);
     try {
-      const tracks = await fetchPlaylistTracks(token, pl.id);
-      if (!tracks.length) {
-        notify(`Playlist "${pl.name}" kosong atau tidak memiliki lagu.`);
-        setLoadingLibraryTracks(false);
-        return;
+      const tracks = await fetchPlaylistTracks(token || '', pl.id, pl.name);
+      if (tracks.length > 0) {
+        setListeningData((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            playlists: prev.playlists.map((p) =>
+              p.id === pl.id ? { ...p, tracks: { total: tracks.length } } : p
+            ),
+          };
+        });
       }
-      const arranged = arrangeTracksByEnergyFlow(tracks);
+      const items: ResolvedPlaylistItem[] = tracks.map((track, idx) => ({
+        candidate: {
+          artist: track.artists[0]?.name || 'Artist',
+          title: track.name,
+          phase:
+            idx < tracks.length * 0.22
+              ? 'Warmup'
+              : idx < tracks.length * 0.55
+              ? 'Groove'
+              : idx < tracks.length * 0.8
+              ? 'Peak'
+              : 'Cooldown',
+          reason: 'Urutan asli di playlist Spotify kamu',
+        },
+        track,
+      }));
       setDraft({
         name: pl.name,
         description:
-          pl.description || 'Disusun ulang dengan Sepotifi AI Studio — alur 4 fase energi.',
+          pl.description || 'Disusun dengan Sepotifi AI Studio.',
         isPublic: Boolean(pl.public),
         prompt: `Disusun ulang dari playlist: ${pl.name}`,
-        items: arranged,
+        items,
         skipped: [],
         curationSource: 'smart-spotify',
         coverUrl: pl.images?.[0]?.url,
         originalPlaylistId: pl.id,
       });
       if (tracks[0]) setActiveTrack(tracks[0]);
-      notify(`"${pl.name}" (${tracks.length} lagu asli) siap ditata!`);
-    } catch {
-      notify('Gagal memuat lagu dari playlist Spotify.');
+      if (tracks.length === 0) {
+        notify(`Playlist "${pl.name}" masih kosong — kamu bisa tambah lagu di sini lalu simpan!`);
+      } else {
+        notify(`"${pl.name}" (${tracks.length} lagu asli) siap diatur!`);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/403|scope|forbidden/i.test(msg)) {
+        notify(
+          'Akses playlist ditolak Spotify (403). Pastikan playlist ini milikmu / akun terdaftar di Dashboard, atau Logout & Login ulang.'
+        );
+      } else {
+        notify(`Gagal memuat lagu: ${msg}`);
+      }
     } finally {
       setLoadingLibraryTracks(false);
     }
@@ -569,6 +767,19 @@ export default function HomePage() {
     });
   };
 
+  const handleMoveTrack = (trackId: string, direction: 'up' | 'down') => {
+    setDraft((prev) => {
+      const idx = prev.items.findIndex((i) => i.track.id === trackId);
+      if (idx === -1) return prev;
+      const targetIdx = direction === 'up' ? idx - 1 : idx + 1;
+      if (targetIdx < 0 || targetIdx >= prev.items.length) return prev;
+      const nextItems = [...prev.items];
+      const [moved] = nextItems.splice(idx, 1);
+      nextItems.splice(targetIdx, 0, moved);
+      return { ...prev, items: nextItems };
+    });
+  };
+
   const handlePlayTrack = (track: SpotifyTrack) => {
     setActiveTrack(track);
     setPlayTriggerCount((c) => c + 1);
@@ -579,6 +790,98 @@ export default function HomePage() {
     setCopiedUri(true);
     setTimeout(() => setCopiedUri(false), 2000);
   };
+
+  const canEditOriginalPlaylist = Boolean(
+    !isDemo &&
+      token &&
+      draft.originalPlaylistId &&
+      draft.originalPlaylistId !== 'liked-songs' &&
+      !draft.originalPlaylistId.startsWith('demo-') &&
+      draft.originalPlaylistId !== 'pl1' &&
+      draft.originalPlaylistId !== 'pl2' &&
+      (!selectedLibraryPlaylist?.owner?.id ||
+        selectedLibraryPlaylist.owner.id === listeningData.profile.id ||
+        selectedLibraryPlaylist.collaborative)
+  );
+
+  const createdResultBanner = createdResult ? (
+    <section className="rounded-2xl bg-[#181818] p-5 space-y-3 border border-[#1ED760]/40 shadow-xl">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <div className="text-xs font-bold uppercase text-[#1ED760]">
+            Tersimpan di Akun Spotify Kamu
+          </div>
+          <h3 className="text-lg font-bold text-white">
+            {createdResult.name} ({createdResult.trackCount} lagu)
+          </h3>
+        </div>
+        <a
+          href={createdResult.url}
+          target="_blank"
+          rel="noreferrer"
+          className="px-5 py-2 rounded-full bg-[#1ED760] hover:bg-[#3BE477] text-black font-bold text-xs flex items-center gap-1.5"
+        >
+          <span>Buka di Aplikasi Spotify</span>
+          <ExternalLink className="w-3.5 h-3.5" />
+        </a>
+      </div>
+    </section>
+  ) : null;
+
+  const renderTrackRowActions = (track: SpotifyTrack, index: number) => (
+    <div
+      className="flex items-center justify-end gap-1.5 text-xs font-mono text-[#B3B3B3]"
+      onClick={(e) => e.stopPropagation()}
+    >
+      <span className="group-hover:hidden">
+        {formatDuration(track.duration_ms)}
+      </span>
+      <div className="hidden group-hover:flex items-center gap-0.5">
+        {phaseFilter === 'ALL' && (
+          <>
+            <button
+              type="button"
+              disabled={index === 0}
+              onClick={() => handleMoveTrack(track.id, 'up')}
+              title="Geser lagu ke atas"
+              className="p-1 text-[#B3B3B3] hover:text-white disabled:opacity-30 cursor-pointer"
+            >
+              <ArrowUp className="w-3.5 h-3.5" />
+            </button>
+            <button
+              type="button"
+              disabled={index === draft.items.length - 1}
+              onClick={() => handleMoveTrack(track.id, 'down')}
+              title="Geser lagu ke bawah"
+              className="p-1 text-[#B3B3B3] hover:text-white disabled:opacity-30 cursor-pointer"
+            >
+              <ArrowDown className="w-3.5 h-3.5" />
+            </button>
+          </>
+        )}
+        <a
+          href={
+            track.external_urls?.spotify ||
+            `https://open.spotify.com/track/${track.id}`
+          }
+          target="_blank"
+          rel="noreferrer"
+          title="Buka di Spotify"
+          className="p-1 text-[#B3B3B3] hover:text-white"
+        >
+          <ExternalLink className="w-3.5 h-3.5" />
+        </a>
+        <button
+          type="button"
+          onClick={() => handleRemoveTrackFromDraft(track.id)}
+          title="Hapus dari playlist"
+          className="p-1 text-[#B3B3B3] hover:text-rose-400 cursor-pointer"
+        >
+          <Trash2 className="w-3.5 h-3.5" />
+        </button>
+      </div>
+    </div>
+  );
 
   return (
     <div className="h-screen w-screen bg-black text-white flex flex-col overflow-hidden select-none">
@@ -900,7 +1203,7 @@ export default function HomePage() {
                               {pl.name}
                             </div>
                             <div className="text-[11px] text-[#888888] truncate">
-                              {pl.tracks?.total || 0} lagu • Klik atur AI
+                              {pl.tracks?.total ? `${pl.tracks.total} lagu` : '0 lagu (kosong)'} • Klik atur AI
                             </div>
                           </div>
                         </div>
@@ -1120,6 +1423,8 @@ export default function HomePage() {
                     <span>Kembali ke Semua Playlist</span>
                   </button>
 
+                  {createdResultBanner}
+
                   {/* Playlist Hero & Controls */}
                   <section className="rounded-2xl bg-[#181818] overflow-hidden shadow-2xl">
                     <div className="p-6 bg-gradient-to-b from-[#242424] to-[#181818] flex flex-col lg:flex-row items-start lg:items-end justify-between gap-6">
@@ -1159,24 +1464,56 @@ export default function HomePage() {
                       </div>
 
                       {/* Action buttons */}
-                      <div className="flex flex-wrap items-center gap-3 shrink-0">
+                      <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setDraft({ ...draft, isPublic: !draft.isPublic })
+                          }
+                          className="px-4 py-2.5 rounded-full bg-[#121212] hover:bg-[#282828] text-xs font-bold text-white flex items-center gap-1.5 transition-colors cursor-pointer"
+                        >
+                          {draft.isPublic ? (
+                            <>
+                              <Globe className="w-3.5 h-3.5 text-[#1ED760]" />
+                              <span>Publik</span>
+                            </>
+                          ) : (
+                            <>
+                              <Lock className="w-3.5 h-3.5 text-[#B3B3B3]" />
+                              <span>Privat</span>
+                            </>
+                          )}
+                        </button>
+
+                        {canEditOriginalPlaylist && (
+                          <button
+                            type="button"
+                            disabled={isSavingPlaylist || !draft.items.length}
+                            onClick={handleUpdateExistingPlaylist}
+                            className="px-5 py-2.5 rounded-full bg-[#1ED760] hover:bg-[#3BE477] disabled:opacity-50 text-black font-black text-xs sm:text-sm flex items-center gap-2 transition-colors cursor-pointer"
+                          >
+                            {isSavingPlaylist ? (
+                              <>
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                                <span>Menyimpan...</span>
+                              </>
+                            ) : (
+                              <>
+                                <Save className="w-4 h-4" />
+                                <span>Simpan ke Playlist Asli</span>
+                              </>
+                            )}
+                          </button>
+                        )}
+
                         <button
                           type="button"
                           disabled={isSavingPlaylist || !draft.items.length}
                           onClick={handleSaveToSpotify}
-                          className="px-6 py-2.5 rounded-full bg-white hover:bg-[#1ED760] disabled:opacity-50 text-black font-black text-xs sm:text-sm flex items-center gap-2 transition-colors cursor-pointer"
+                          className="px-5 py-2.5 rounded-full bg-white hover:bg-[#1ED760] disabled:opacity-50 text-black font-black text-xs sm:text-sm flex items-center gap-2 transition-colors cursor-pointer"
                         >
-                          {isSavingPlaylist ? (
-                            <>
-                              <Loader2 className="w-4 h-4 animate-spin" />
-                              <span>Menyimpan...</span>
-                            </>
-                          ) : (
-                            <>
-                              <Plus className="w-4 h-4" />
-                              <span>Simpan Sebagai Playlist Baru</span>
-                            </>
-                          )}
+                          <Plus className="w-4 h-4" />
+                          <span>Simpan Sebagai Playlist Baru</span>
                         </button>
                       </div>
                     </div>
@@ -1297,7 +1634,7 @@ export default function HomePage() {
 
                     {/* Tracklist Table */}
                     <div className="p-4 sm:p-6">
-                      <div className="grid grid-cols-[32px_1fr_72px] sm:grid-cols-[36px_1.5fr_1fr_72px] gap-4 px-3 py-2 border-b border-white/10 text-xs font-bold text-[#B3B3B3] uppercase tracking-wider mb-2">
+                      <div className="grid grid-cols-[32px_1fr_108px] sm:grid-cols-[36px_1.5fr_1fr_108px] gap-4 px-3 py-2 border-b border-white/10 text-xs font-bold text-[#B3B3B3] uppercase tracking-wider mb-2">
                         <div className="text-center">#</div>
                         <div>Lagu & Artis</div>
                         <div className="hidden sm:block">Tahap Energi</div>
@@ -1306,89 +1643,66 @@ export default function HomePage() {
                         </div>
                       </div>
 
-                      <div className="space-y-1">
-                        {filteredItems.map(({ candidate, track }, index) => {
-                          const isCurrent = activeTrack?.id === track.id;
-                          return (
-                            <div
-                              key={`${track.id}-${index}`}
-                              onClick={() => handlePlayTrack(track)}
-                              className={`grid grid-cols-[32px_1fr_72px] sm:grid-cols-[36px_1.5fr_1fr_72px] gap-4 px-3 py-2.5 rounded-xl items-center group transition-colors cursor-pointer ${
-                                isCurrent ? 'bg-[#242424]' : 'hover:bg-[#242424]/70'
-                              }`}
-                            >
-                              <div className="flex items-center justify-center text-sm text-[#B3B3B3]">
-                                <span
-                                  className={`group-hover:hidden ${
-                                    isCurrent ? 'text-[#1ED760] font-bold' : ''
-                                  }`}
-                                >
-                                  {index + 1}
-                                </span>
-                                <Play className="w-4 h-4 fill-white text-white hidden group-hover:block" />
-                              </div>
-
-                              <div className="flex items-center gap-3 min-w-0">
-                                <img
-                                  src={track.album.images?.[0]?.url || playlistCoverUrl}
-                                  alt={track.name}
-                                  className="w-10 h-10 rounded-md object-cover shrink-0"
-                                />
-                                <div className="min-w-0">
-                                  <div
-                                    className={`text-sm font-bold truncate ${
-                                      isCurrent ? 'text-[#1ED760]' : 'text-white'
+                      {filteredItems.length === 0 ? (
+                        <div className="py-10 text-center text-xs sm:text-sm text-[#888888]">
+                          Playlist ini masih kosong — cari &amp; tambahkan lagu lewat kolom pencarian di atas!
+                        </div>
+                      ) : (
+                        <div className="space-y-1">
+                          {filteredItems.map(({ candidate, track }, index) => {
+                            const isCurrent = activeTrack?.id === track.id;
+                            return (
+                              <div
+                                key={`${track.id}-${index}`}
+                                onClick={() => handlePlayTrack(track)}
+                                className={`grid grid-cols-[32px_1fr_108px] sm:grid-cols-[36px_1.5fr_1fr_108px] gap-4 px-3 py-2.5 rounded-xl items-center group transition-colors cursor-pointer ${
+                                  isCurrent ? 'bg-[#242424]' : 'hover:bg-[#242424]/70'
+                                }`}
+                              >
+                                <div className="flex items-center justify-center text-sm text-[#B3B3B3]">
+                                  <span
+                                    className={`group-hover:hidden ${
+                                      isCurrent ? 'text-[#1ED760] font-bold' : ''
                                     }`}
                                   >
-                                    {track.name}
-                                  </div>
-                                  <div className="text-xs text-[#B3B3B3] truncate">
-                                    {track.artists.map((a) => a.name).join(', ')}
+                                    {index + 1}
+                                  </span>
+                                  <Play className="w-4 h-4 fill-white text-white hidden group-hover:block" />
+                                </div>
+
+                                <div className="flex items-center gap-3 min-w-0">
+                                  <img
+                                    src={track.album.images?.[0]?.url || playlistCoverUrl}
+                                    alt={track.name}
+                                    className="w-10 h-10 rounded-md object-cover shrink-0"
+                                  />
+                                  <div className="min-w-0">
+                                    <div
+                                      className={`text-sm font-bold truncate ${
+                                        isCurrent ? 'text-[#1ED760]' : 'text-white'
+                                      }`}
+                                    >
+                                      {track.name}
+                                    </div>
+                                    <div className="text-xs text-[#B3B3B3] truncate">
+                                      {track.artists.map((a) => a.name).join(', ')}
+                                    </div>
                                   </div>
                                 </div>
-                              </div>
 
-                              <div className="hidden sm:block text-xs text-[#B3B3B3] truncate">
-                                <span className="px-2 py-0.5 rounded bg-[#121212] text-white font-bold mr-2">
-                                  {candidate.phase}
-                                </span>
-                                <span>{candidate.reason}</span>
-                              </div>
-
-                              <div
-                                className="flex items-center justify-end gap-2 text-xs font-mono text-[#B3B3B3]"
-                                onClick={(e) => e.stopPropagation()}
-                              >
-                                <span className="group-hover:hidden">
-                                  {formatDuration(track.duration_ms)}
-                                </span>
-                                <div className="hidden group-hover:flex items-center gap-1.5">
-                                  <a
-                                    href={
-                                      track.external_urls?.spotify ||
-                                      `https://open.spotify.com/track/${track.id}`
-                                    }
-                                    target="_blank"
-                                    rel="noreferrer"
-                                    title="Buka di Spotify"
-                                    className="p-1 text-[#B3B3B3] hover:text-white"
-                                  >
-                                    <ExternalLink className="w-3.5 h-3.5" />
-                                  </a>
-                                  <button
-                                    type="button"
-                                    onClick={() => handleRemoveTrackFromDraft(track.id)}
-                                    title="Hapus dari playlist"
-                                    className="p-1 text-[#B3B3B3] hover:text-rose-400 cursor-pointer"
-                                  >
-                                    <Trash2 className="w-3.5 h-3.5" />
-                                  </button>
+                                <div className="hidden sm:block text-xs text-[#B3B3B3] truncate">
+                                  <span className="px-2 py-0.5 rounded bg-[#121212] text-white font-bold mr-2">
+                                    {candidate.phase}
+                                  </span>
+                                  <span>{candidate.reason}</span>
                                 </div>
+
+                                {renderTrackRowActions(track, index)}
                               </div>
-                            </div>
-                          );
-                        })}
-                      </div>
+                            );
+                          })}
+                        </div>
+                      )}
                     </div>
                   </section>
                 </div>
@@ -1405,21 +1719,38 @@ export default function HomePage() {
                         Koleksi Playlist Spotify Kamu
                       </h1>
                       <p className="text-xs sm:text-sm text-[#B3B3B3] mt-1">
-                        Pilih playlist untuk ditata ulang alur energinya (AI Flow) atau diremix dengan AI.
+                        Pilih playlist untuk ditata ulang alur energinya (AI Flow), edit lagu, atau simpan langsung ke Spotify.
                       </p>
                     </div>
 
-                    <div className="relative w-full sm:w-72">
-                      <Search className="w-4 h-4 text-[#888888] absolute left-3.5 top-1/2 -translate-y-1/2" />
-                      <input
-                        type="text"
-                        value={librarySearchQuery}
-                        onChange={(e) => setLibrarySearchQuery(e.target.value)}
-                        placeholder="Cari playlist kamu..."
-                        className="w-full pl-10 pr-4 py-2 rounded-full bg-[#181818] border border-white/10 text-xs sm:text-sm text-white placeholder:text-[#727272] focus:border-[#1ED760] focus:outline-none"
-                      />
+                    <div className="flex items-center gap-2 w-full sm:w-auto">
+                      <div className="relative flex-1 sm:w-64">
+                        <Search className="w-4 h-4 text-[#888888] absolute left-3.5 top-1/2 -translate-y-1/2" />
+                        <input
+                          type="text"
+                          value={librarySearchQuery}
+                          onChange={(e) => setLibrarySearchQuery(e.target.value)}
+                          placeholder="Cari playlist kamu..."
+                          className="w-full pl-10 pr-4 py-2 rounded-full bg-[#181818] border border-white/10 text-xs sm:text-sm text-white placeholder:text-[#727272] focus:border-[#1ED760] focus:outline-none"
+                        />
+                      </div>
+                      <button
+                        type="button"
+                        onClick={handleRefreshData}
+                        title="Muat ulang daftar playlist Spotify"
+                        className="px-3.5 py-2 rounded-full bg-[#181818] hover:bg-[#242424] border border-white/10 text-xs font-bold text-white flex items-center gap-1.5 cursor-pointer shrink-0"
+                      >
+                        <RefreshCw className="w-3.5 h-3.5 text-[#1ED760]" />
+                        <span>Refresh</span>
+                      </button>
                     </div>
                   </div>
+
+                  {listeningData.playlistWarning && (
+                    <div className="p-4 rounded-xl bg-amber-500/10 border border-amber-500/30 text-xs text-amber-200">
+                      Gagal memuat sebagian playlist dari Spotify: {listeningData.playlistWarning}. Pastikan akunmu terdaftar di Spotify Developer Dashboard atau coba Logout &amp; Login ulang.
+                    </div>
+                  )}
 
                   <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4">
                     {filteredPlaylists.map((pl) => {
@@ -1457,7 +1788,7 @@ export default function HomePage() {
                                 {pl.name}
                               </h3>
                               <p className="text-[11px] text-[#888888] truncate mt-0.5">
-                                {pl.tracks?.total || 0} lagu
+                                {pl.tracks?.total ? `${pl.tracks.total} lagu` : '0 lagu (kosong / draft)'}
                               </p>
                             </div>
                           </div>
@@ -1495,8 +1826,8 @@ export default function HomePage() {
                   <div className="flex items-center bg-[#121212] p-1 rounded-full border border-white/5">
                     {(
                       [
-                        ['smart-spotify', 'Smart DNA (Profil Kamu)'],
-                        ['gemini', 'Gemini AI DJ (LLM Reasoning)'],
+                        ['gemini', '✨ Gemini AI DJ (Cerdas & Reasoning)'],
+                        ['smart-spotify', 'Smart Rule (Offline / Tanpa AI)'],
                         ['custom-list', 'Input Manual'],
                       ] as const
                     ).map(([modeKey, label]) => (
@@ -1518,19 +1849,19 @@ export default function HomePage() {
 
                 {/* Micro-explainer badge */}
                 <div className="text-xs px-3.5 py-2 rounded-xl bg-[#121212] border border-white/5 flex items-center gap-2 text-[#B3B3B3]">
-                  {curationMode === 'smart-spotify' && (
-                    <>
-                      <span className="w-2 h-2 rounded-full bg-[#1ED760]" />
-                      <span>
-                        <strong className="text-white">Smart DNA Mode:</strong> Mengurasi secara instan berbasis profil Spotify kamu (Top Artists, Tracks & Genre Seeds). Cepat & tanpa perlu kuota API.
-                      </span>
-                    </>
-                  )}
                   {curationMode === 'gemini' && (
                     <>
                       <span className="w-2 h-2 rounded-full bg-cyan-400" />
                       <span>
-                        <strong className="text-white">Gemini AI DJ Mode:</strong> Menggunakan LLM Gemini 2.5 Flash untuk memahami nuansa lirik, tema emosional naratif, dan kurasi mendalam.
+                        <strong className="text-white">Gemini AI DJ Mode (Rekomendasi Utama):</strong> Menganalisis konteks emosional, genre, tema playlist library, & selera musikmu secara mendalam menggunakan LLM Gemini AI.
+                      </span>
+                    </>
+                  )}
+                  {curationMode === 'smart-spotify' && (
+                    <>
+                      <span className="w-2 h-2 rounded-full bg-[#1ED760]" />
+                      <span>
+                        <strong className="text-white">Smart Rule Mode (Offline Fallback):</strong> Kurasi instan berbasis aturan kata kunci & preset statis (tanpa reasoning LLM). Digunakan jika offline atau kuota API habis.
                       </span>
                     </>
                   )}
@@ -1631,29 +1962,187 @@ export default function HomePage() {
                   </div>
 
                   {/* Right 4 Cols: Options & Generate CTA */}
-                  <div className="lg:col-span-4 bg-[#121212] p-4 rounded-xl space-y-3.5">
-                    <label className="flex items-center justify-between gap-2 cursor-pointer">
-                      <div>
-                        <div className="text-xs font-bold text-white">
-                          Padukan dengan Top Tracks-ku
-                        </div>
-                        <div className="text-xs text-[#B3B3B3]">
-                          Sisipkan lagu favoritmu yang selaras
+                  <div className="lg:col-span-4 bg-[#121212] p-4 rounded-xl space-y-4">
+                    {/* Track Count Slider */}
+                    <div className="space-y-3 bg-[#181818] p-3 rounded-lg border border-[#282828]">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-bold text-white flex items-center gap-1.5">
+                          <SlidersHorizontal className="w-3.5 h-3.5 text-[#1ED760]" />
+                          Jumlah Lagu
+                        </span>
+                        <span className="text-xs font-mono font-bold px-2 py-0.5 rounded-full bg-[#1ED760]/15 text-[#1ED760] border border-[#1ED760]/30 shadow-sm">
+                          {trackCount} Lagu
+                        </span>
+                      </div>
+
+                      {/* Slider with exact ruler ticks */}
+                      <div className="space-y-1.5 px-0.5">
+                        <input
+                          type="range"
+                          min={10}
+                          max={50}
+                          step={5}
+                          value={trackCount}
+                          onChange={(e) => setTrackCount(Number(e.target.value))}
+                          className="w-full accent-[#1ED760] cursor-pointer h-1.5 bg-[#2A2A2A] rounded-lg appearance-none"
+                        />
+                        <div className="relative w-full h-3.5 text-[10px] font-mono text-[#777777] select-none">
+                          <button
+                            type="button"
+                            onClick={() => setTrackCount(10)}
+                            className={`absolute left-0 cursor-pointer hover:text-white transition-colors ${
+                              trackCount === 10 ? 'text-[#1ED760] font-bold' : ''
+                            }`}
+                          >
+                            10
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setTrackCount(20)}
+                            className={`absolute left-[25%] -translate-x-1/2 cursor-pointer hover:text-white transition-colors ${
+                              trackCount === 20 ? 'text-[#1ED760] font-bold' : ''
+                            }`}
+                          >
+                            20
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setTrackCount(30)}
+                            className={`absolute left-[50%] -translate-x-1/2 cursor-pointer hover:text-white transition-colors ${
+                              trackCount === 30 ? 'text-[#1ED760] font-bold' : ''
+                            }`}
+                          >
+                            30
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setTrackCount(40)}
+                            className={`absolute left-[75%] -translate-x-1/2 cursor-pointer hover:text-white transition-colors ${
+                              trackCount === 40 ? 'text-[#1ED760] font-bold' : ''
+                            }`}
+                          >
+                            40
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setTrackCount(50)}
+                            className={`absolute right-0 cursor-pointer hover:text-white transition-colors ${
+                              trackCount === 50 ? 'text-[#1ED760] font-bold' : ''
+                            }`}
+                          >
+                            50
+                          </button>
                         </div>
                       </div>
-                      <input
-                        type="checkbox"
-                        checked={useListeningTaste}
-                        onChange={(e) => setUseListeningTaste(e.target.checked)}
-                        className="w-4 h-4 accent-[#1ED760] rounded"
-                      />
-                    </label>
+
+                      {/* Preset Pills */}
+                      <div className="grid grid-cols-4 gap-1.5 pt-0.5">
+                        {[
+                          { count: 15, label: '15 EP' },
+                          { count: 25, label: '25 Std' },
+                          { count: 40, label: '40 Long' },
+                          { count: 50, label: '50 Max' },
+                        ].map((preset) => (
+                          <button
+                            key={preset.count}
+                            type="button"
+                            onClick={() => setTrackCount(preset.count)}
+                            className={`py-1 rounded text-[11px] font-mono transition-all text-center ${
+                              trackCount === preset.count
+                                ? 'bg-[#1ED760] text-black font-bold shadow-sm'
+                                : 'bg-[#242424] text-[#A7A7A7] hover:text-white hover:bg-[#2C2C2C]'
+                            }`}
+                          >
+                            {preset.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Taste & Library Context Blending */}
+                    <div className="space-y-2.5 bg-[#181818] p-3 rounded-lg border border-[#282828]">
+                      <label className="flex items-start justify-between gap-2 cursor-pointer select-none">
+                        <div className="space-y-0.5">
+                          <div className="text-xs font-bold text-white flex items-center gap-1.5">
+                            <Heart className="w-3.5 h-3.5 text-[#1ED760] fill-[#1ED760]" />
+                            <span>Konteks Library & Selera</span>
+                          </div>
+                          <p className="text-[11px] text-[#A7A7A7] leading-tight">
+                            AI membaca Liked Songs, artis favorit, &amp; playlist-mu sebagai acuan selera.
+                          </p>
+                        </div>
+                        <input
+                          type="checkbox"
+                          checked={useListeningTaste}
+                          onChange={(e) => setUseListeningTaste(e.target.checked)}
+                          className="w-4 h-4 mt-0.5 accent-[#1ED760] rounded cursor-pointer shrink-0"
+                        />
+                      </label>
+
+                      {useListeningTaste && (
+                        <div className="space-y-1.5 pt-2 border-t border-[#282828]">
+                          <div className="text-[10px] font-semibold uppercase tracking-wider text-[#727272]">
+                            Strategi Kurasi:
+                          </div>
+                          <div className="grid grid-cols-2 gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => setTasteBlendMode('balanced')}
+                              className={`p-2 rounded-md text-xs font-medium text-left transition-all ${
+                                tasteBlendMode === 'balanced'
+                                  ? 'bg-[#1ED760] text-black font-bold shadow-sm'
+                                  : 'bg-[#242424] text-[#B3B3B3] hover:text-white hover:bg-[#2A2A2A]'
+                              }`}
+                            >
+                              <div className="leading-tight">Campur Seimbang</div>
+                              <div
+                                className={`text-[9px] mt-0.5 ${
+                                  tasteBlendMode === 'balanced'
+                                    ? 'text-black/80 font-medium'
+                                    : 'text-[#727272]'
+                                }`}
+                              >
+                                Favorit + Baru
+                              </div>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setTasteBlendMode('discovery')}
+                              className={`p-2 rounded-md text-xs font-medium text-left transition-all ${
+                                tasteBlendMode === 'discovery'
+                                  ? 'bg-[#1ED760] text-black font-bold shadow-sm'
+                                  : 'bg-[#242424] text-[#B3B3B3] hover:text-white hover:bg-[#2A2A2A]'
+                              }`}
+                            >
+                              <div className="leading-tight">Eksplorasi Baru</div>
+                              <div
+                                className={`text-[9px] mt-0.5 ${
+                                  tasteBlendMode === 'discovery'
+                                    ? 'text-black/80 font-medium'
+                                    : 'text-[#727272]'
+                                }`}
+                              >
+                                100% Track Baru
+                              </div>
+                            </button>
+                          </div>
+                          {listeningData && (
+                            <div className="flex items-center gap-1.5 text-[10px] text-[#A7A7A7] pt-1">
+                              <span className="w-1.5 h-1.5 rounded-full bg-[#1ED760]"></span>
+                              <span>
+                                {listeningData.playlists?.length || 0} playlist &amp; {listeningData.topArtists?.short_term?.length || 0} artis terhubung
+                              </span>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
 
                     <button
                       type="button"
                       disabled={isGenerating}
                       onClick={() => runPlaylistGenerator()}
-                      className="w-full py-3.5 px-5 rounded-full bg-[#1ED760] hover:bg-[#3BE477] disabled:opacity-60 text-black font-black text-sm flex items-center justify-center gap-2 transition-colors cursor-pointer"
+                      className="w-full py-3.5 px-5 rounded-full bg-[#1ED760] hover:bg-[#3BE477] disabled:opacity-60 text-black font-black text-sm flex items-center justify-center gap-2 transition-colors cursor-pointer shadow-lg shadow-[#1ED760]/10"
                     >
                       {isGenerating ? (
                         <>
@@ -1663,7 +2152,7 @@ export default function HomePage() {
                       ) : (
                         <>
                           <Wand2 className="w-4 h-4" />
-                          <span>Generate AI Mix Sekarang</span>
+                          <span>Generate AI Mix ({trackCount} Lagu)</span>
                         </>
                       )}
                     </button>
@@ -1700,30 +2189,22 @@ export default function HomePage() {
                 </div>
               </section>
 
-              {/* Created Playlist Success Card */}
-              {createdResult && (
-                <section className="rounded-2xl bg-[#181818] p-5 space-y-3 border border-[#1ED760]/40 shadow-xl">
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <div>
-                      <div className="text-xs font-bold uppercase text-[#1ED760]">
-                        Tersimpan di Akun Spotify Kamu
-                      </div>
-                      <h3 className="text-lg font-bold text-white">
-                        {createdResult.name} ({createdResult.trackCount} lagu)
-                      </h3>
-                    </div>
-                    <a
-                      href={createdResult.url}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="px-5 py-2 rounded-full bg-[#1ED760] hover:bg-[#3BE477] text-black font-bold text-xs flex items-center gap-1.5"
-                    >
-                      <span>Buka di Aplikasi Spotify</span>
-                      <ExternalLink className="w-3.5 h-3.5" />
-                    </a>
-                  </div>
-                </section>
+              {/* Fallback / Warning Notice */}
+              {curationNotice && (
+                <div className="p-3.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-xs text-amber-200 flex items-center justify-between gap-3">
+                  <span>{curationNotice}</span>
+                  <button
+                    type="button"
+                    onClick={() => setCurationNotice(null)}
+                    className="text-amber-200/70 hover:text-amber-100 cursor-pointer"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
               )}
+
+              {/* Created Playlist Success Card */}
+              {createdResultBanner}
 
               {/* GENERATED PLAYLIST STUDIO & TRACKLIST */}
               <section className="rounded-2xl bg-[#181818] overflow-hidden shadow-2xl">
@@ -1739,7 +2220,12 @@ export default function HomePage() {
                       <div className="flex items-center gap-2 text-xs font-bold text-[#1ED760] uppercase">
                         <ListMusic className="w-3.5 h-3.5" />
                         <span>
-                          Hasil Kurasi AI Creator • {draft.items.length} Lagu (
+                          {draft.curationSource === 'gemini'
+                            ? 'Hasil Kurasi Gemini AI'
+                            : draft.curationSource === 'custom-list'
+                            ? 'Input Manual'
+                            : 'Hasil Kurasi Smart Rule'}{' '}
+                          • {draft.items.length} Lagu (
                           {Math.max(1, Math.round(totalDraftDurationMs / 60000))}{' '}
                           mnt)
                         </span>
@@ -1945,7 +2431,7 @@ export default function HomePage() {
                   ) : (
                     <>
                       {/* Table Header */}
-                      <div className="grid grid-cols-[32px_1fr_72px] sm:grid-cols-[36px_1.5fr_1fr_72px] gap-4 px-3 py-2 border-b border-white/10 text-xs font-bold text-[#B3B3B3] uppercase tracking-wider mb-2">
+                      <div className="grid grid-cols-[32px_1fr_108px] sm:grid-cols-[36px_1.5fr_1fr_108px] gap-4 px-3 py-2 border-b border-white/10 text-xs font-bold text-[#B3B3B3] uppercase tracking-wider mb-2">
                         <div className="text-center">#</div>
                         <div>Lagu & Artis</div>
                         <div className="hidden sm:block">
@@ -1963,7 +2449,7 @@ export default function HomePage() {
                             <div
                               key={`${track.id}-${index}`}
                               onClick={() => handlePlayTrack(track)}
-                              className={`grid grid-cols-[32px_1fr_72px] sm:grid-cols-[36px_1.5fr_1fr_72px] gap-4 px-3 py-2.5 rounded-xl items-center group transition-colors cursor-pointer ${
+                              className={`grid grid-cols-[32px_1fr_108px] sm:grid-cols-[36px_1.5fr_1fr_108px] gap-4 px-3 py-2.5 rounded-xl items-center group transition-colors cursor-pointer ${
                                 isCurrent
                                   ? 'bg-[#242424]'
                                   : 'hover:bg-[#242424]/70'
@@ -2012,38 +2498,7 @@ export default function HomePage() {
                                 <span>{candidate.reason}</span>
                               </div>
 
-                              <div
-                                className="flex items-center justify-end gap-2 text-xs font-mono text-[#B3B3B3]"
-                                onClick={(e) => e.stopPropagation()}
-                              >
-                                <span className="group-hover:hidden">
-                                  {formatDuration(track.duration_ms)}
-                                </span>
-                                <div className="hidden group-hover:flex items-center gap-1.5">
-                                  <a
-                                    href={
-                                      track.external_urls?.spotify ||
-                                      `https://open.spotify.com/track/${track.id}`
-                                    }
-                                    target="_blank"
-                                    rel="noreferrer"
-                                    title="Buka di Spotify"
-                                    className="p-1 text-[#B3B3B3] hover:text-white"
-                                  >
-                                    <ExternalLink className="w-3.5 h-3.5" />
-                                  </a>
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      handleRemoveTrackFromDraft(track.id)
-                                    }
-                                    title="Hapus dari playlist"
-                                    className="p-1 text-[#B3B3B3] hover:text-rose-400 cursor-pointer"
-                                  >
-                                    <Trash2 className="w-3.5 h-3.5" />
-                                  </button>
-                                </div>
-                              </div>
+                              {renderTrackRowActions(track, index)}
                             </div>
                           );
                         })}

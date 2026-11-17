@@ -61,6 +61,11 @@ export interface SpotifyPlaylistSummary {
   name: string;
   description?: string;
   public?: boolean;
+  collaborative?: boolean;
+  owner?: {
+    id: string;
+    display_name?: string;
+  };
   tracks: { total: number };
   images?: SpotifyImage[];
   external_urls?: { spotify: string };
@@ -73,6 +78,7 @@ export interface ListeningData {
   recentlyPlayed: RecentlyPlayedItem[];
   currentlyPlaying: CurrentlyPlaying | null;
   playlists: SpotifyPlaylistSummary[];
+  playlistWarning?: string;
 }
 
 export type EnergyPhase = 'Warmup' | 'Groove' | 'Peak' | 'Cooldown';

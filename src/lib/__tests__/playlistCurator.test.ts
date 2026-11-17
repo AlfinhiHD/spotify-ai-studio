@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   arrangeTracksByEnergyFlow,
   assignEnergyPhase,
@@ -6,10 +6,12 @@ import {
   computeMassiveDnaAnalytics,
   computeTopGenres,
   generateAestheticTitle,
+  generateGeminiCuratedPlan,
   generateSmartCuratedPlan,
   interleaveByArtist,
   matchTrackArtist,
   parseCustomTrackLines,
+  preserveArcAndDecollideArtists,
 } from '../playlistCurator';
 import { DEMO_LISTENING_DATA } from '../demoData';
 import { SpotifyTrack } from '../../types/spotify';
@@ -128,5 +130,103 @@ describe('playlistCurator & MassiveDnaAnalytics', () => {
     );
     expect(plan.candidates.length).toBeGreaterThanOrEqual(15);
     expect(plan.description).toContain('Hindia');
+  });
+
+  it('preserves 4-phase energy arc order and de-collides consecutive artists', () => {
+    const raw = [
+      { artist: 'Bernadya', title: 'Satu Bulan', phase: 'Warmup', reason: 'Intro' },
+      { artist: 'Bernadya', title: 'Untungnya', phase: 'Warmup', reason: 'Warmup 2' },
+      { artist: 'NIKI', title: 'lowkey', phase: 'Groove', reason: 'Groove 1' },
+      { artist: 'Hindia', title: 'Cincin', phase: 'Peak', reason: 'Peak 1' },
+      { artist: 'Kunto Aji', title: 'Rehat', phase: 'Cooldown', reason: 'Outro' },
+    ];
+    const result = preserveArcAndDecollideArtists(raw, 2, 10);
+    expect(result).toHaveLength(5);
+    expect(result[0].phase).toBe('Warmup');
+    expect(result[result.length - 1].phase).toBe('Cooldown');
+    expect(result[0].artist).not.toBe(result[1].artist);
+  });
+
+  it('curates genre-specific clusters accurately (Nostalgia Indo, K-Pop, J-Pop, Heartbreak)', () => {
+    const indo90s = generateSmartCuratedPlan(
+      'lagu nostalgia band indo 2000an sheila on 7 dan dewa 19',
+      DEMO_LISTENING_DATA,
+      false
+    );
+    expect(
+      indo90s.candidates.some((c) => /sheila on 7|dewa 19|peterpan|padi/i.test(c.artist))
+    ).toBe(true);
+
+    const jpop = generateSmartCuratedPlan(
+      'playlist j-pop anime dan city pop jepang seru',
+      DEMO_LISTENING_DATA,
+      false
+    );
+    expect(
+      jpop.candidates.some((c) => /yoasobi|fujii kaze|radwimps|imase|miki matsubara/i.test(c.artist))
+    ).toBe(true);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('normalizes phase aliases in preserveArcAndDecollideArtists', () => {
+    const raw = [
+      { artist: 'A', title: 'S1', phase: 'Intro' },
+      { artist: 'B', title: 'S2', phase: 'Build-up' },
+      { artist: 'C', title: 'S3', phase: 'Climax' },
+      { artist: 'D', title: 'S4', phase: 'Outro' },
+    ];
+    const result = preserveArcAndDecollideArtists(raw, 2, 10);
+    expect(result.map((r) => r.phase)).toEqual(['Warmup', 'Groove', 'Peak', 'Cooldown']);
+  });
+
+  it('uses working Gemini model cascade and surfaces warning when all models fail', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    text: JSON.stringify({
+                      name: 'Pop Punk Sore',
+                      description: 'Enerjik sore hari',
+                      tracks: [
+                        { artist: 'Paramore', title: 'Misery Business', phase: 'Peak', reason: 'Enerjik' },
+                        { artist: 'blink-182', title: 'All The Small Things', phase: 'Groove', reason: 'Catchy' },
+                      ],
+                    }),
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+
+    const okPlan = await generateGeminiCuratedPlan('fake-key', 'pop punk sore', DEMO_LISTENING_DATA, false, 10);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(String(fetchMock.mock.calls[0][0])).toContain('gemini-3-flash-preview');
+    expect(okPlan.usedFallback).toBe(false);
+    expect(okPlan.modelUsed).toBe('gemini-3-flash-preview');
+    expect(okPlan.candidates).toHaveLength(2);
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(() =>
+      Promise.resolve(
+        new Response(JSON.stringify({ error: { message: 'Service Unavailable' } }), {
+          status: 503,
+        })
+      )
+    );
+
+    const fallbackPlan = await generateGeminiCuratedPlan('fake-key', 'pop punk sore', DEMO_LISTENING_DATA, false, 10);
+    expect(fallbackPlan.usedFallback).toBe(true);
+    expect(fallbackPlan.warning).toContain('503');
+    expect(fallbackPlan.candidates.length).toBeGreaterThan(0);
   });
 });
