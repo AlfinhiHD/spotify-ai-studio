@@ -84,6 +84,15 @@ function formatDuration(ms: number): string {
   return `${minutes}:${seconds.toString().padStart(2, '0')}`;
 }
 
+function buildDraftSignature(d: PlaylistDraft): string {
+  return JSON.stringify({
+    name: d.name.trim(),
+    description: d.description.trim(),
+    isPublic: d.isPublic,
+    trackIds: d.items.map((i) => i.track.id),
+  });
+}
+
 function buildInitialDemoDraft(presetId = VIBE_PRESETS[0].id): PlaylistDraft {
   const preset = VIBE_PRESETS.find((p) => p.id === presetId) || VIBE_PRESETS[0];
   const plan = generateSmartCuratedPlan(
@@ -158,6 +167,9 @@ export default function HomePage() {
   // Active Draft & Playback State
   const [draft, setDraft] = useState<PlaylistDraft>(() =>
     buildInitialDemoDraft(VIBE_PRESETS[0].id)
+  );
+  const [savedDraftSignature, setSavedDraftSignature] = useState<string | null>(
+    null
   );
   const [curationNotice, setCurationNotice] = useState<string | null>(null);
   const [activeTrack, setActiveTrack] = useState<SpotifyTrack | null>(
@@ -283,6 +295,7 @@ export default function HomePage() {
     setIsDemo(true);
     setListeningData(DEMO_LISTENING_DATA);
     setDraft(buildInitialDemoDraft(VIBE_PRESETS[0].id));
+    setSavedDraftSignature(null);
     setSelectedLibraryPlaylist(null);
     setCreatedResult(null);
     notify('Sesi diputus — kembali ke Mode Pratinjau.');
@@ -483,7 +496,7 @@ CRITICAL REQUIREMENT: Match the exact sonic universe, emotional texture, instrum
 
       const targetPreset = VIBE_PRESETS.find((p) => p.id === targetPresetId);
 
-      setDraft({
+      const nextDraft: PlaylistDraft = {
         name: plan.name,
         description: plan.description,
         isPublic: false,
@@ -492,7 +505,9 @@ CRITICAL REQUIREMENT: Match the exact sonic universe, emotional texture, instrum
         skipped: resolved.skipped,
         curationSource: activeSource,
         coverUrl: targetPreset?.image || finalItems[0]?.track.album.images?.[0]?.url,
-      });
+      };
+      setDraft(nextDraft);
+      setSavedDraftSignature(buildDraftSignature(nextDraft));
 
       if (finalItems[0]?.track) {
         setActiveTrack(finalItems[0].track);
@@ -528,6 +543,7 @@ CRITICAL REQUIREMENT: Match the exact sonic universe, emotional texture, instrum
         listeningData.profile.id
       );
       setCreatedResult(result);
+      setSavedDraftSignature(buildDraftSignature(draft));
       await refreshLibraryPlaylists(token, listeningData.profile.id);
       notify(`Tersimpan sebagai playlist baru: "${result.name}"`);
     } catch (err) {
@@ -553,6 +569,7 @@ CRITICAL REQUIREMENT: Match the exact sonic universe, emotional texture, instrum
         draft
       );
       setCreatedResult(result);
+      setSavedDraftSignature(buildDraftSignature(draft));
       setSelectedLibraryPlaylist((prev) =>
         prev && prev.id === result.id
           ? {
@@ -593,15 +610,22 @@ CRITICAL REQUIREMENT: Match the exact sonic universe, emotional texture, instrum
     }
   };
 
+  const updateDraft = (
+    updater: PlaylistDraft | ((prev: PlaylistDraft) => PlaylistDraft)
+  ) => {
+    setCreatedResult(null);
+    setDraft(updater);
+  };
+
   const handleAddTrackToDraft = (track: SpotifyTrack) => {
     if (draft.items.some((i) => i.track.id === track.id)) {
       notify('Lagu sudah ada di dalam playlist.');
       return;
     }
-    setDraft({
-      ...draft,
+    updateDraft((prev) => ({
+      ...prev,
       items: [
-        ...draft.items,
+        ...prev.items,
         {
           candidate: {
             artist: track.artists.map((a) => a.name).join(', '),
@@ -612,8 +636,10 @@ CRITICAL REQUIREMENT: Match the exact sonic universe, emotional texture, instrum
           track,
         },
       ],
-    });
-    notify(`Ditambahkan: ${track.name}`);
+    }));
+    notify(
+      `Ditambahkan: ${track.name} — klik Simpan agar tersimpan di Spotify.`
+    );
   };
 
   const handleEnhancePrompt = async () => {
@@ -691,7 +717,7 @@ CRITICAL REQUIREMENT: Match the exact sonic universe, emotional texture, instrum
         },
         track,
       }));
-      setDraft({
+      const loadedDraft: PlaylistDraft = {
         name: pl.name,
         description:
           pl.description || 'Disusun dengan Sepotifi AI Studio.',
@@ -702,7 +728,9 @@ CRITICAL REQUIREMENT: Match the exact sonic universe, emotional texture, instrum
         curationSource: 'smart-spotify',
         coverUrl: pl.images?.[0]?.url,
         originalPlaylistId: pl.id,
-      });
+      };
+      setDraft(loadedDraft);
+      setSavedDraftSignature(buildDraftSignature(loadedDraft));
       if (tracks[0]) setActiveTrack(tracks[0]);
       if (tracks.length === 0) {
         notify(`Playlist "${pl.name}" masih kosong — kamu bisa tambah lagu di sini lalu simpan!`);
@@ -727,12 +755,12 @@ CRITICAL REQUIREMENT: Match the exact sonic universe, emotional texture, instrum
     if (!draft.items.length) return;
     const currentTracks = draft.items.map((i) => i.track);
     const reordered = arrangeTracksByEnergyFlow(currentTracks);
-    setDraft((prev) => ({
+    updateDraft((prev) => ({
       ...prev,
       items: reordered,
     }));
     notify(
-      'Alur lagu berhasil disusun ke 4 fase energi (Warmup → Groove → Peak → Cooldown)!'
+      'Urutan disusun ke 4 fase energi — klik Simpan untuk menerapkan ke Spotify!'
     );
   };
 
@@ -761,23 +789,38 @@ CRITICAL REQUIREMENT: Match the exact sonic universe, emotional texture, instrum
   };
 
   const handleRemoveTrackFromDraft = (trackId: string) => {
-    setDraft({
-      ...draft,
-      items: draft.items.filter((item) => item.track.id !== trackId),
-    });
+    const targetTrack = draft.items.find((item) => item.track.id === trackId);
+    updateDraft((prev) => ({
+      ...prev,
+      items: prev.items.filter((item) => item.track.id !== trackId),
+    }));
+    if (targetTrack) {
+      notify(
+        `"${targetTrack.track.name}" dihapus dari draft — klik Simpan agar tersimpan di Spotify.`
+      );
+    }
   };
 
   const handleMoveTrack = (trackId: string, direction: 'up' | 'down') => {
-    setDraft((prev) => {
-      const idx = prev.items.findIndex((i) => i.track.id === trackId);
-      if (idx === -1) return prev;
-      const targetIdx = direction === 'up' ? idx - 1 : idx + 1;
-      if (targetIdx < 0 || targetIdx >= prev.items.length) return prev;
+    const idx = draft.items.findIndex((i) => i.track.id === trackId);
+    if (idx === -1) return;
+    const targetIdx = direction === 'up' ? idx - 1 : idx + 1;
+    if (targetIdx < 0 || targetIdx >= draft.items.length) return;
+    const movedName = draft.items[idx].track.name;
+    updateDraft((prev) => {
+      const curIdx = prev.items.findIndex((i) => i.track.id === trackId);
+      const nextIdx = direction === 'up' ? curIdx - 1 : curIdx + 1;
+      if (curIdx === -1 || nextIdx < 0 || nextIdx >= prev.items.length) {
+        return prev;
+      }
       const nextItems = [...prev.items];
-      const [moved] = nextItems.splice(idx, 1);
-      nextItems.splice(targetIdx, 0, moved);
+      const [moved] = nextItems.splice(curIdx, 1);
+      nextItems.splice(nextIdx, 0, moved);
       return { ...prev, items: nextItems };
     });
+    notify(
+      `Urutan "${movedName}" digeser — klik Simpan agar tersimpan ke Spotify.`
+    );
   };
 
   const handlePlayTrack = (track: SpotifyTrack) => {
@@ -803,6 +846,25 @@ CRITICAL REQUIREMENT: Match the exact sonic universe, emotional texture, instrum
         selectedLibraryPlaylist.owner.id === listeningData.profile.id ||
         selectedLibraryPlaylist.collaborative)
   );
+
+  const hasUnsavedChanges = useMemo(() => {
+    if (!savedDraftSignature) return false;
+    return buildDraftSignature(draft) !== savedDraftSignature;
+  }, [draft, savedDraftSignature]);
+
+  const unsavedChangesBanner = hasUnsavedChanges ? (
+    <div className="px-4 py-3 rounded-xl bg-amber-500/15 border border-amber-400/40 text-xs text-amber-100 flex flex-wrap items-center justify-between gap-3">
+      <div className="flex items-center gap-2.5">
+        <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse shrink-0" />
+        <span>
+          <strong className="text-amber-300">Perubahan belum tersimpan ke Spotify:</strong>{' '}
+          {canEditOriginalPlaylist
+            ? 'Urutan lagu, isi track, judul, atau privasi masih di draft lokal. Klik "Simpan ke Playlist Asli" (atau "Simpan Sebagai Playlist Baru") agar tersimpan di akun Spotify kamu.'
+            : 'Perubahan urutan atau daftar lagu masih di draft lokal. Klik "Simpan ke Koleksi Spotify" untuk menyimpannya ke Spotify.'}
+        </span>
+      </div>
+    </div>
+  ) : null;
 
   const createdResultBanner = createdResult ? (
     <section className="rounded-2xl bg-[#181818] p-5 space-y-3 border border-[#1ED760]/40 shadow-xl">
@@ -1424,6 +1486,7 @@ CRITICAL REQUIREMENT: Match the exact sonic universe, emotional texture, instrum
                   </button>
 
                   {createdResultBanner}
+                  {unsavedChangesBanner}
 
                   {/* Playlist Hero & Controls */}
                   <section className="rounded-2xl bg-[#181818] overflow-hidden shadow-2xl">
@@ -1446,7 +1509,9 @@ CRITICAL REQUIREMENT: Match the exact sonic universe, emotional texture, instrum
                           <input
                             type="text"
                             value={draft.name}
-                            onChange={(e) => setDraft({ ...draft, name: e.target.value })}
+                            onChange={(e) =>
+                              updateDraft((prev) => ({ ...prev, name: e.target.value }))
+                            }
                             aria-label="Judul Playlist"
                             className="w-full bg-transparent text-2xl sm:text-3xl font-black text-white border-b border-transparent hover:border-white/20 focus:border-[#1ED760] focus:outline-none pb-0.5"
                           />
@@ -1455,7 +1520,10 @@ CRITICAL REQUIREMENT: Match the exact sonic universe, emotional texture, instrum
                             type="text"
                             value={draft.description}
                             onChange={(e) =>
-                              setDraft({ ...draft, description: e.target.value })
+                              updateDraft((prev) => ({
+                                ...prev,
+                                description: e.target.value,
+                              }))
                             }
                             aria-label="Deskripsi Playlist"
                             className="w-full bg-transparent text-xs sm:text-sm text-[#B3B3B3] border-b border-transparent hover:border-white/20 focus:border-[#1ED760] focus:outline-none"
@@ -1468,7 +1536,10 @@ CRITICAL REQUIREMENT: Match the exact sonic universe, emotional texture, instrum
                         <button
                           type="button"
                           onClick={() =>
-                            setDraft({ ...draft, isPublic: !draft.isPublic })
+                            updateDraft((prev) => ({
+                              ...prev,
+                              isPublic: !prev.isPublic,
+                            }))
                           }
                           className="px-4 py-2.5 rounded-full bg-[#121212] hover:bg-[#282828] text-xs font-bold text-white flex items-center gap-1.5 transition-colors cursor-pointer"
                         >
@@ -1490,7 +1561,9 @@ CRITICAL REQUIREMENT: Match the exact sonic universe, emotional texture, instrum
                             type="button"
                             disabled={isSavingPlaylist || !draft.items.length}
                             onClick={handleUpdateExistingPlaylist}
-                            className="px-5 py-2.5 rounded-full bg-[#1ED760] hover:bg-[#3BE477] disabled:opacity-50 text-black font-black text-xs sm:text-sm flex items-center gap-2 transition-colors cursor-pointer"
+                            className={`px-5 py-2.5 rounded-full bg-[#1ED760] hover:bg-[#3BE477] disabled:opacity-50 text-black font-black text-xs sm:text-sm flex items-center gap-2 transition-colors cursor-pointer ${
+                              hasUnsavedChanges ? 'ring-2 ring-amber-400 shadow-lg shadow-amber-500/20' : ''
+                            }`}
                           >
                             {isSavingPlaylist ? (
                               <>
@@ -1500,7 +1573,11 @@ CRITICAL REQUIREMENT: Match the exact sonic universe, emotional texture, instrum
                             ) : (
                               <>
                                 <Save className="w-4 h-4" />
-                                <span>Simpan ke Playlist Asli</span>
+                                <span>
+                                  {hasUnsavedChanges
+                                    ? 'Simpan Perubahan ke Playlist Asli'
+                                    : 'Simpan ke Playlist Asli'}
+                                </span>
                               </>
                             )}
                           </button>
@@ -2061,11 +2138,11 @@ CRITICAL REQUIREMENT: Match the exact sonic universe, emotional texture, instrum
 
                     {/* Taste & Library Context Blending */}
                     <div className="space-y-2.5 bg-[#181818] p-3 rounded-lg border border-[#282828]">
-                      <label className="flex items-start justify-between gap-2 cursor-pointer select-none">
+                      <label className="flex items-start justify-between gap-3 cursor-pointer select-none">
                         <div className="space-y-0.5">
                           <div className="text-xs font-bold text-white flex items-center gap-1.5">
                             <Heart className="w-3.5 h-3.5 text-[#1ED760] fill-[#1ED760]" />
-                            <span>Konteks Library & Selera</span>
+                            <span>Konteks Library &amp; Selera</span>
                           </div>
                           <p className="text-[11px] text-[#A7A7A7] leading-tight">
                             AI membaca Liked Songs, artis favorit, &amp; playlist-mu sebagai acuan selera.
@@ -2075,8 +2152,24 @@ CRITICAL REQUIREMENT: Match the exact sonic universe, emotional texture, instrum
                           type="checkbox"
                           checked={useListeningTaste}
                           onChange={(e) => setUseListeningTaste(e.target.checked)}
-                          className="w-4 h-4 mt-0.5 accent-[#1ED760] rounded cursor-pointer shrink-0"
+                          className="sr-only"
                         />
+                        <span
+                          aria-hidden="true"
+                          className={`mt-0.5 w-9 h-5 rounded-full transition-colors relative shrink-0 ${
+                            useListeningTaste
+                              ? 'bg-[#1ED760]'
+                              : 'bg-[#2C2C2C] border border-white/20'
+                          }`}
+                        >
+                          <span
+                            className={`absolute top-0.5 w-3.5 h-3.5 rounded-full transition-transform ${
+                              useListeningTaste
+                                ? 'left-[18px] bg-black'
+                                : 'left-0.5 bg-[#888888]'
+                            }`}
+                          />
+                        </span>
                       </label>
 
                       {useListeningTaste && (
@@ -2205,6 +2298,7 @@ CRITICAL REQUIREMENT: Match the exact sonic universe, emotional texture, instrum
 
               {/* Created Playlist Success Card */}
               {createdResultBanner}
+              {unsavedChangesBanner}
 
               {/* GENERATED PLAYLIST STUDIO & TRACKLIST */}
               <section className="rounded-2xl bg-[#181818] overflow-hidden shadow-2xl">
@@ -2235,7 +2329,10 @@ CRITICAL REQUIREMENT: Match the exact sonic universe, emotional texture, instrum
                         type="text"
                         value={draft.name}
                         onChange={(e) =>
-                          setDraft({ ...draft, name: e.target.value })
+                          updateDraft((prev) => ({
+                            ...prev,
+                            name: e.target.value,
+                          }))
                         }
                         aria-label="Judul Playlist"
                         className="w-full bg-transparent text-2xl sm:text-3xl font-black text-white border-b border-transparent hover:border-white/20 focus:border-[#1ED760] focus:outline-none pb-0.5"
@@ -2245,7 +2342,10 @@ CRITICAL REQUIREMENT: Match the exact sonic universe, emotional texture, instrum
                         type="text"
                         value={draft.description}
                         onChange={(e) =>
-                          setDraft({ ...draft, description: e.target.value })
+                          updateDraft((prev) => ({
+                            ...prev,
+                            description: e.target.value,
+                          }))
                         }
                         aria-label="Deskripsi Playlist"
                         className="w-full bg-transparent text-xs sm:text-sm text-[#B3B3B3] border-b border-transparent hover:border-white/20 focus:border-[#1ED760] focus:outline-none"
@@ -2258,7 +2358,10 @@ CRITICAL REQUIREMENT: Match the exact sonic universe, emotional texture, instrum
                     <button
                       type="button"
                       onClick={() =>
-                        setDraft({ ...draft, isPublic: !draft.isPublic })
+                        updateDraft((prev) => ({
+                          ...prev,
+                          isPublic: !prev.isPublic,
+                        }))
                       }
                       className="px-4 py-2.5 rounded-full bg-[#121212] hover:bg-[#282828] text-xs font-bold text-white flex items-center gap-1.5 transition-colors cursor-pointer"
                     >
@@ -2279,7 +2382,9 @@ CRITICAL REQUIREMENT: Match the exact sonic universe, emotional texture, instrum
                       type="button"
                       disabled={isSavingPlaylist || !draft.items.length}
                       onClick={handleSaveToSpotify}
-                      className="px-6 py-2.5 rounded-full bg-white hover:bg-[#1ED760] disabled:opacity-50 text-black font-black text-xs sm:text-sm flex items-center gap-2 transition-colors cursor-pointer"
+                      className={`px-6 py-2.5 rounded-full bg-white hover:bg-[#1ED760] disabled:opacity-50 text-black font-black text-xs sm:text-sm flex items-center gap-2 transition-colors cursor-pointer ${
+                        hasUnsavedChanges ? 'ring-2 ring-amber-400 shadow-lg shadow-amber-500/20' : ''
+                      }`}
                     >
                       {isSavingPlaylist ? (
                         <>
@@ -2289,7 +2394,11 @@ CRITICAL REQUIREMENT: Match the exact sonic universe, emotional texture, instrum
                       ) : (
                         <>
                           <Plus className="w-4 h-4" />
-                          <span>Simpan ke Koleksi Spotify</span>
+                          <span>
+                            {hasUnsavedChanges
+                              ? 'Simpan Perubahan ke Spotify'
+                              : 'Simpan ke Koleksi Spotify'}
+                          </span>
                         </>
                       )}
                     </button>
